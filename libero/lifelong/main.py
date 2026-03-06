@@ -21,7 +21,7 @@ from libero.libero import get_libero_path
 from libero.libero.benchmark import get_benchmark
 from libero.lifelong.algos import get_algo_class, get_algo_list
 from libero.lifelong.models import get_policy_list
-from libero.lifelong.datasets import GroupedTaskDataset, SequenceVLDataset, get_dataset
+from libero.lifelong.datasets import GroupedTaskDataset, SequenceVLDataset, H5pyPicklableVLDataset, get_dataset
 from libero.lifelong.metric import evaluate_loss, evaluate_success
 from libero.lifelong.utils import (
     NpEncoder,
@@ -61,6 +61,20 @@ def main(hydra_cfg):
     benchmark = get_benchmark(cfg.benchmark_name)(cfg.data.task_order_index)
     n_manip_tasks = benchmark.n_tasks
 
+    # LIBERO_90은 hdf5_cache_mode="all" 기준 압축 해제 후 약 120~250GB RAM이 필요.
+    # datasets.py의 get_dataset() 기본값이 "all"로 설정되어 있으므로 실행을 차단.
+    # LIBERO_90을 꼭 실행해야 한다면 datasets.py의 hdf5_cache_mode를 "low_dim"으로 변경하고
+    # train.num_workers=0, eval.num_workers=0 을 함께 지정할 것.
+    if cfg.benchmark_name.upper() == "LIBERO_90":
+        print(
+            "\n[error] LIBERO_90 실행이 차단되었습니다.\n"
+            "        현재 datasets.py의 hdf5_cache_mode='all'로 설정되어 있어\n"
+            "        LIBERO_90 전체 로드 시 약 120~250GB RAM이 필요합니다.\n"
+            "        실행하려면 datasets.py의 hdf5_cache_mode를 'low_dim'으로 변경하고\n"
+            "        train.num_workers=0, eval.num_workers=0 을 지정하세요.\n"
+        )
+        sys.exit(1)
+
     # prepare datasets from the benchmark
     manip_datasets = []
     descriptions = []
@@ -94,7 +108,10 @@ def main(hydra_cfg):
     gsz = cfg.data.task_group_size
     if gsz == 1:  # each manipulation task is its own lifelong learning task
         datasets = [
-            SequenceVLDataset(ds, emb) for (ds, emb) in zip(manip_datasets, task_embs)
+            # H5pyPicklableVLDataset: h5py 핸들을 pickle 전 닫고 워커에서 lazy 재오픈
+            # → num_workers > 0 사용 가능, 추가 RAM 없음 (hdf5_cache_mode="low_dim" 기준)
+            H5pyPicklableVLDataset(SequenceVLDataset(ds, emb))
+            for (ds, emb) in zip(manip_datasets, task_embs)
         ]
         n_demos = [data.n_demos for data in datasets]
         n_sequences = [data.total_num_sequences for data in datasets]

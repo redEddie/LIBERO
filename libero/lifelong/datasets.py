@@ -23,7 +23,11 @@ def get_dataset(
     seq_len=1,
     frame_stack=1,
     filter_key=None,
-    hdf5_cache_mode="low_dim",
+    hdf5_cache_mode="low_dim",  # "low_dim": 저차원 데이터(joint, gripper)만 캐싱, 이미지는 매 step 디스크에서 읽음
+                                #            → RAM 절약. 단 h5py 핸들이 열려있어 num_workers=0 필수.
+                                # "all"    : raw HDF5 + 모든 getitem 결과까지 이중 캐싱.
+                                #            image-based 데이터셋은 sliding-window 중복으로 수백 GB 필요 → 사용 금지.
+                                # "none"   : 캐싱 없음 (RAM 최소, 디스크 I/O 최대)
     *args,
     **kwargs
 ):
@@ -125,6 +129,45 @@ class GroupedTaskDataset(Dataset):
         return_dict = self.sequence_datasets[oti].__getitem__(oi)
         return_dict["task_emb"] = self.task_embs[oti]
         return return_dict
+
+
+class H5pyPicklableVLDataset(Dataset):
+    """
+    SequenceVLDataset wrapper that enables num_workers > 0 without extra RAM.
+
+    문제: robomimic의 SequenceDataset은 내부에 열린 h5py 파일 핸들을 보유.
+         spawn 방식 멀티프로세싱에서 DataLoader 워커로 dataset을 전달할 때
+         pickle이 필요한데, h5py 핸들은 pickle 불가 → TypeError 발생.
+
+    해결: __getstate__에서 h5py 핸들을 닫고(None), __setstate__ 후
+         robomimic의 lazy property가 워커 프로세스에서 자동으로 재오픈.
+
+    메모리: hdf5_cache_mode="low_dim" 기준, 이미지는 각 워커에서 디스크에서 읽으므로
+            RAM 추가 사용 없음. num_workers 수만큼 병렬 I/O 가능.
+    """
+
+    def __init__(self, vl_dataset):
+        self._vl = vl_dataset
+        self.task_emb = vl_dataset.task_emb
+        self.n_demos = vl_dataset.n_demos
+        self.total_num_sequences = vl_dataset.total_num_sequences
+
+    def __len__(self):
+        return len(self._vl)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # pickle 전 h5py 핸들 닫기 → _hdf5_file = None
+        # (robomimic의 hdf5_file property가 워커에서 자동 재오픈)
+        state["_vl"].sequence_dataset.close_and_delete_hdf5_handle()
+        return state
+
+    def __setstate__(self, state):
+        # 복원 후 h5py는 첫 __getitem__ 호출 시 lazy하게 재오픈됨
+        self.__dict__.update(state)
+
+    def __getitem__(self, idx):
+        return self._vl[idx]
 
 
 class TruncatedSequenceDataset(Dataset):
